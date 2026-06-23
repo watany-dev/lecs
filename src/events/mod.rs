@@ -9,6 +9,8 @@ use serde::Serialize;
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum EventType {
+    /// Container image was pulled.
+    ImagePulled,
     /// Container was created.
     Created,
     /// Container was started.

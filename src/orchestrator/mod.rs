@@ -292,6 +292,8 @@ pub struct StartupResult {
 }
 
 /// Create and start a single container, emitting lifecycle events.
+///
+/// Automatically pulls the container image before creation.
 async fn create_and_start_container(
     client: &(impl ContainerRuntime + ?Sized),
     spec: &ContainerSpec,
@@ -305,6 +307,26 @@ async fn create_and_start_container(
         .get(crate::labels::TASK)
         .cloned()
         .unwrap_or_default();
+
+    // Pull the image before creating the container
+    let image = &spec.config.image;
+    tracing::info!(container = %name, image = %image, "Pulling image");
+    client.pull_image(image).await.map_err(|e| {
+        (
+            StartupResult {
+                started: started.to_vec(),
+            },
+            OrchestratorError::from(e),
+        )
+    })?;
+    event_sink.emit(&LifecycleEvent::new(
+        EventType::ImagePulled,
+        &family,
+        Some(name),
+        Some(image),
+    ));
+    tracing::info!(container = %name, image = %image, "Pulled image");
+
     let id = client.create_container(&spec.config).await.map_err(|e| {
         (
             StartupResult {
@@ -1381,6 +1403,7 @@ mod tests {
         let mock = MockContainerClient::new();
         // Two containers, no deps — both in layer 0
         for name in &["c1", "c2"] {
+            mock.pull_image_results.lock().unwrap().push_back(Ok(()));
             mock.create_container_results
                 .lock()
                 .unwrap()
@@ -1403,6 +1426,7 @@ mod tests {
         let mock = MockContainerClient::new();
         // a -> b (START condition)
         for name in &["a", "b"] {
+            mock.pull_image_results.lock().unwrap().push_back(Ok(()));
             mock.create_container_results
                 .lock()
                 .unwrap()
@@ -1430,6 +1454,7 @@ mod tests {
         let mock = MockContainerClient::new();
         // db (with healthcheck) -> app (HEALTHY)
         for name in &["db", "app"] {
+            mock.pull_image_results.lock().unwrap().push_back(Ok(()));
             mock.create_container_results
                 .lock()
                 .unwrap()
@@ -1477,6 +1502,26 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err.1, OrchestratorError::CyclicDependency(_)),
+            "unexpected: {:?}",
+            err.1
+        );
+        assert!(err.0.started.is_empty());
+    }
+
+    #[tokio::test]
+    async fn orchestrate_startup_image_pull_failure() {
+        let mock = MockContainerClient::new();
+        mock.pull_image_results
+            .lock()
+            .unwrap()
+            .push_back(Err(crate::container::ContainerError::RuntimeNotRunning));
+
+        let specs = vec![make_spec("a", &[])];
+        let err = orchestrate_startup(&mock, specs, &NullEventSink)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.1, OrchestratorError::Runtime(_)),
             "unexpected: {:?}",
             err.1
         );
@@ -1697,6 +1742,7 @@ mod tests {
     #[tokio::test]
     async fn orchestrate_startup_emits_created_and_started_events() {
         let mock = MockContainerClient::new();
+        mock.pull_image_results.lock().unwrap().push_back(Ok(()));
         mock.create_container_results
             .lock()
             .unwrap()
@@ -1712,8 +1758,9 @@ mod tests {
         assert_eq!(result.started.len(), 1);
 
         let events = sink.events();
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0].event_type, EventType::Created));
-        assert!(matches!(events[1].event_type, EventType::Started));
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0].event_type, EventType::ImagePulled));
+        assert!(matches!(events[1].event_type, EventType::Created));
+        assert!(matches!(events[2].event_type, EventType::Started));
     }
 }

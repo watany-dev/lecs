@@ -8,6 +8,7 @@ use bollard::container::{
     RemoveContainerOptions, StatsOptions, StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
+use bollard::image::CreateImageOptions;
 use bollard::models::{EndpointSettings, HealthConfig, HostConfig, PortBinding, ResourcesUlimits};
 use bollard::network::{CreateNetworkOptions, ListNetworksOptions};
 use futures_util::Stream;
@@ -71,6 +72,13 @@ pub trait ContainerRuntime: Send + Sync {
 
     /// Execute a command inside a running container.
     async fn exec_container(&self, id: &str, cmd: &[String]) -> Result<ExecResult, ContainerError>;
+
+    /// Pull a container image from a registry.
+    ///
+    /// The `image` parameter is the full image reference (e.g., `nginx:latest`,
+    /// `registry.example.com/app:v1.0`). The implementation should handle
+    /// splitting the reference into repository and tag components.
+    async fn pull_image(&self, image: &str) -> Result<(), ContainerError>;
 }
 
 /// Result of executing a command inside a container.
@@ -253,6 +261,31 @@ fn parse_host_url(url: &str) -> (HostScheme, &str) {
         },
         |path| (HostScheme::Unix, path),
     )
+}
+
+/// Parse an image reference into (repository, tag) components.
+///
+/// Handles the following formats:
+/// - `nginx` → `("nginx", "latest")`
+/// - `nginx:1.25` → `("nginx", "1.25")`
+/// - `registry.example.com:5000/app` → `("registry.example.com:5000/app", "latest")`
+/// - `registry.example.com:5000/app:v1` → `("registry.example.com:5000/app", "v1")`
+/// - `nginx@sha256:abc...` → `("nginx@sha256:abc...", "")` (digest reference, no tag)
+fn parse_image_reference(image: &str) -> (&str, &str) {
+    // Digest reference — pass through as-is with empty tag
+    if image.contains('@') {
+        return (image, "");
+    }
+
+    // Find the last colon that is part of the tag (not a port number).
+    // A colon in a tag comes after the last `/` (if any).
+    let after_last_slash = image.rfind('/').map_or(0, |i| i + 1);
+    image[after_last_slash..]
+        .rfind(':')
+        .map_or((image, "latest"), |offset| {
+            let colon_pos = after_last_slash + offset;
+            (&image[..colon_pos], &image[colon_pos + 1..])
+        })
 }
 
 /// Return candidate socket paths for Podman runtime connection.
@@ -698,6 +731,23 @@ impl ContainerRuntime for ContainerClient {
             exit_code: inspect.exit_code,
         })
     }
+
+    async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
+        let (from_image, tag) = parse_image_reference(image);
+
+        let options = CreateImageOptions {
+            from_image,
+            tag,
+            ..Default::default()
+        };
+
+        self.docker
+            .create_image(Some(options), None, None)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        Ok(())
+    }
 }
 
 /// Calculate CPU usage percentage from a Docker stats snapshot.
@@ -896,6 +946,7 @@ pub mod test_support {
         pub wait_container_results: Mutex<VecDeque<Result<WaitResult, ContainerError>>>,
         pub stats_container_results: Mutex<VecDeque<Result<ContainerStats, ContainerError>>>,
         pub exec_container_results: Mutex<VecDeque<Result<ExecResult, ContainerError>>>,
+        pub pull_image_results: Mutex<VecDeque<Result<(), ContainerError>>>,
     }
 
     impl MockContainerClient {
@@ -913,6 +964,7 @@ pub mod test_support {
                 wait_container_results: Mutex::new(VecDeque::new()),
                 stats_container_results: Mutex::new(VecDeque::new()),
                 exec_container_results: Mutex::new(VecDeque::new()),
+                pull_image_results: Mutex::new(VecDeque::new()),
             }
         }
     }
@@ -996,6 +1048,10 @@ pub mod test_support {
             _cmd: &[String],
         ) -> Result<ExecResult, ContainerError> {
             pop_result(&self.exec_container_results)
+        }
+
+        async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+            pop_result(&self.pull_image_results)
         }
     }
 }
@@ -1393,5 +1449,45 @@ mod tests {
 
         let host_config = result.host_config.as_ref().expect("host_config");
         assert!(host_config.binds.is_none());
+    }
+
+    #[test]
+    fn parse_image_reference_simple_name() {
+        assert_eq!(parse_image_reference("nginx"), ("nginx", "latest"));
+    }
+
+    #[test]
+    fn parse_image_reference_with_tag() {
+        assert_eq!(parse_image_reference("nginx:1.25"), ("nginx", "1.25"));
+    }
+
+    #[test]
+    fn parse_image_reference_registry_with_port() {
+        assert_eq!(
+            parse_image_reference("registry.example.com:5000/app"),
+            ("registry.example.com:5000/app", "latest")
+        );
+    }
+
+    #[test]
+    fn parse_image_reference_registry_with_port_and_tag() {
+        assert_eq!(
+            parse_image_reference("registry.example.com:5000/app:v1"),
+            ("registry.example.com:5000/app", "v1")
+        );
+    }
+
+    #[test]
+    fn parse_image_reference_digest() {
+        let img = "nginx@sha256:abc123";
+        assert_eq!(parse_image_reference(img), (img, ""));
+    }
+
+    #[test]
+    fn parse_image_reference_namespaced() {
+        assert_eq!(
+            parse_image_reference("library/nginx:alpine"),
+            ("library/nginx", "alpine")
+        );
     }
 }

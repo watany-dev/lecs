@@ -311,5 +311,5 @@ Phase 0-2.5: ✅ 完了
 - Prometheus / Grafana 等の外部監視スタック連携
 - awsvpc ネットワークモード完全再現
 - Service Mesh / Service Connect
-- ECR push/pull（Docker CLI の責務）
+- ECR 認証付き push/pull（Docker CLI の責務、匿名 pull は自動実行）
 - Cluster / Container Instance 管理（ローカルでは不要）

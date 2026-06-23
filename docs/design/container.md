@@ -212,6 +212,7 @@ pub trait ContainerRuntime: Send + Sync {
     async fn list_containers(&self, task_filter: Option<&str>) -> Result<Vec<ContainerInfo>, ContainerError>;
     async fn inspect_container(&self, id: &str) -> Result<ContainerInspection, ContainerError>;
     async fn wait_container(&self, id: &str) -> Result<WaitResult, ContainerError>;
+    async fn pull_image(&self, image: &str) -> Result<(), ContainerError>;
 }
 ```
 
@@ -360,7 +361,7 @@ let networking_config = NetworkingConfig {
 | エラー状況 | ContainerError バリアント | 対応 |
 |---|---|---|
 | コンテナランタイム未起動 | `RuntimeNotRunning` | `connect()` で ping 失敗時に検出 |
-| イメージが存在しない | `Api(...)` | ランタイムがデフォルトで pull を試行 |
+| イメージ pull 失敗 | `Api(...)` | コンテナ作成前の `pull_image` で検出・報告 |
 | ポート競合 | `Api(...)` | ランタイム API エラーをそのまま伝搬 |
 | ネットワーク既存 | — | `create_network` 内で既存を検出し再利用（エラーにしない） |
 | コンテナ停止タイムアウト | `Api(...)` | 10 秒後にランタイムが自動 kill |
@@ -387,8 +388,22 @@ let networking_config = NetworkingConfig {
 - `wait_container()`: コンテナの終了を待機（`bollard::Docker::wait_container` の Stream から最初のアイテムを取得）
 - `MockContainerClient` に `inspect_container_results` / `wait_container_results` キューを追加
 
+## 自動イメージ pull
+
+コンテナ作成前に `pull_image()` で自動的にイメージを pull する。
+
+- bollard の `create_image` API（Docker Engine API `POST /images/create`）を使用
+- イメージ参照を repository と tag に分離する `parse_image_reference()` ヘルパー
+  - `nginx` → `("nginx", "latest")`
+  - `nginx:1.25` → `("nginx", "1.25")`
+  - `registry.example.com:5000/app:v1` → `("registry.example.com:5000/app", "v1")`
+  - `nginx@sha256:abc...` → digest 参照としてそのまま渡す
+- ローカルにキャッシュ済みのイメージは高速な no-op
+- `orchestrate_startup()` の各コンテナ作成前に実行
+- `restart_container()` でもベストエフォートで再 pull（失敗時は警告のみで続行）
+- `ImagePulled` ライフサイクルイベントを発行
+
 ## 制限事項
 
-- イメージの明示的な pull 制御は未実装（ランタイムのデフォルト動作に委ねる）
 - コンテナのリソース制限（CPU/メモリ）は設定するが、厳密な enforcement はランタイムに委ねる
 - ボリュームマウントは未対応 → Phase 5

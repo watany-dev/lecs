@@ -30,6 +30,7 @@ ECS タスク定義をローカルで実行し、ECS アプリが期待する実
 | FR-2.4 | 複数コンテナの順次起動に対応する | ✅ 実装済み |
 | FR-2.5 | コンテナのログをプレフィックス付きでストリーム表示する | ✅ 実装済み |
 | FR-2.6 | `Ctrl+C` でグレースフルシャットダウンする | ✅ 実装済み |
+| FR-2.7 | コンテナ作成前にイメージを自動で pull する | ✅ 実装済み |
 
 ### FR-3: コンテナ停止
 
@@ -206,5 +207,5 @@ ECS タスク定義をローカルで実行し、ECS アプリが期待する実
 - Prometheus / Grafana 等の外部監視スタック連携
 - awsvpc ネットワークモード完全再現
 - Service Mesh / Service Connect
-- ECR push/pull（Docker CLI の責務）
+- ECR 認証付き push/pull（Docker CLI の責務、匿名 pull は自動実行）
 - Cluster / Container Instance 管理（ローカルでは不要）
