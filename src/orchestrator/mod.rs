@@ -1329,6 +1329,98 @@ mod tests {
                 let result = resolve_start_order(&[]).expect("empty should resolve");
                 prop_assert!(result.is_empty());
             }
+
+            /// Property: Layer count is at most the number of nodes.
+            #[test]
+            fn layer_count_bounded_by_node_count(deps in arb_dag(8)) {
+                let layers = resolve_start_order(&deps).expect("should resolve");
+                prop_assert!(layers.len() <= deps.len());
+            }
+
+            /// Property: Total nodes preserved — no inventions, no drops.
+            #[test]
+            fn total_nodes_preserved(deps in arb_dag(8)) {
+                let layers = resolve_start_order(&deps).expect("should resolve");
+                let total: usize = layers.iter().map(Vec::len).sum();
+                prop_assert_eq!(total, deps.len());
+            }
+
+            /// Property: Resolving the same input twice gives byte-identical layers.
+            #[test]
+            fn resolve_is_deterministic(deps in arb_dag(8)) {
+                let a = resolve_start_order(&deps).expect("should resolve");
+                let b = resolve_start_order(&deps).expect("should resolve");
+                prop_assert_eq!(a, b);
+            }
+
+            /// Property: Reversing the input's container order yields the same layers
+            /// (since each layer is sorted — permutation invariance).
+            #[test]
+            fn permutation_invariant(deps in arb_dag(8)) {
+                let original = resolve_start_order(&deps).expect("should resolve");
+                let reversed: Vec<DependencyInfo> = deps.iter().rev().cloned().collect();
+                let after = resolve_start_order(&reversed).expect("should resolve");
+                prop_assert_eq!(original, after);
+            }
+
+            /// Property: Cycle error messages always contain the `" -> "` separator.
+            #[test]
+            fn cycle_error_contains_arrow(deps in arb_cyclic_graph()) {
+                let err = resolve_start_order(&deps).expect_err("cyclic should fail");
+                let msg = err.to_string();
+                prop_assert!(msg.contains(" -> "), "expected arrow in: {}", msg);
+            }
+
+            /// Property: Every node named in a cycle path corresponds to an actual
+            /// input node (format_cycle_path never invents names).
+            #[test]
+            fn cycle_path_nodes_exist_in_input(deps in arb_cyclic_graph()) {
+                let err = resolve_start_order(&deps).expect_err("cyclic should fail");
+                let msg = err.to_string();
+                let input_names: HashSet<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+                // Strip the "cyclic dependency detected: " prefix
+                let path_str = msg
+                    .strip_prefix("cyclic dependency detected: ")
+                    .unwrap_or(&msg);
+                for token in path_str.split(" -> ") {
+                    prop_assert!(
+                        input_names.contains(token),
+                        "cycle token '{}' not in input nodes",
+                        token
+                    );
+                }
+            }
+
+            /// Property: A single independent node produces exactly one layer of one node.
+            #[test]
+            fn single_node_no_deps_single_layer(name in "[a-z][a-z0-9]{0,5}") {
+                let deps = vec![DependencyInfo { name: name.clone(), depends_on: vec![] }];
+                let layers = resolve_start_order(&deps).expect("should resolve");
+                prop_assert_eq!(layers.len(), 1);
+                prop_assert_eq!(&layers[0], &vec![name]);
+            }
+
+            /// Property: A linear chain a → b → c → … produces exactly n layers of 1.
+            #[test]
+            fn chain_produces_n_layers(n in 1usize..=8) {
+                let names: Vec<String> = (0..n).map(|i| format!("n{i:02}")).collect();
+                let deps: Vec<DependencyInfo> = names.iter().enumerate().map(|(i, name)| {
+                    let depends_on = if i == 0 {
+                        vec![]
+                    } else {
+                        vec![DependsOn {
+                            container_name: names[i - 1].clone(),
+                            condition: DependencyCondition::Start,
+                        }]
+                    };
+                    DependencyInfo { name: name.clone(), depends_on }
+                }).collect();
+                let layers = resolve_start_order(&deps).expect("should resolve");
+                prop_assert_eq!(layers.len(), n);
+                for layer in &layers {
+                    prop_assert_eq!(layer.len(), 1);
+                }
+            }
         }
     }
 

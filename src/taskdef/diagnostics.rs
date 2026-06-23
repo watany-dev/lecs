@@ -1329,6 +1329,103 @@ mod tests {
                 prop_assert!(diags.is_empty(), "valid ARN should produce no warnings: {:?}", diags);
             }
 
+            /// Property: A task definition with no port mappings anywhere produces no diagnostics.
+            #[test]
+            fn no_ports_no_conflicts(
+                n_containers in 1usize..=5usize,
+            ) {
+                let containers: Vec<_> = (0..n_containers)
+                    .map(|i| (format!("c{i}"), "alpine:latest".to_string(), vec![]))
+                    .collect();
+                let td = make_task_def_with_containers(containers);
+                prop_assert!(check_port_conflicts(&td).is_empty());
+            }
+
+            /// Property: A set of pairwise-distinct (host_port, protocol) pairs yields no conflicts.
+            #[test]
+            fn unique_host_ports_no_conflicts(
+                pairs in proptest::collection::btree_set(
+                    (1024u16..65_000, prop_oneof![Just("tcp".to_string()), Just("udp".to_string())]),
+                    1..=8,
+                ),
+            ) {
+                // Put each mapping in a separate container to avoid container-port duplication.
+                let containers: Vec<_> = pairs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (hp, proto))| {
+                        (
+                            format!("c{i}"),
+                            "alpine:latest".to_string(),
+                            vec![(80, Some(hp), proto)],
+                        )
+                    })
+                    .collect();
+                let td = make_task_def_with_containers(containers);
+                prop_assert!(
+                    check_port_conflicts(&td).is_empty(),
+                    "unique (host_port, protocol) pairs should not conflict: {:?}",
+                    check_port_conflicts(&td)
+                );
+            }
+
+            /// Property: Inserting an exact duplicate (host_port, protocol) always produces
+            /// at least one Error diagnostic.
+            #[test]
+            fn duplicate_pair_always_conflicts(
+                host_port in 1024u16..65_000,
+                proto in prop_oneof![Just("tcp".to_string()), Just("udp".to_string())],
+            ) {
+                let td = make_task_def_with_containers(vec![
+                    ("a".into(), "alpine:latest".into(), vec![(80, Some(host_port), proto.clone())]),
+                    ("b".into(), "alpine:latest".into(), vec![(81, Some(host_port), proto)]),
+                ]);
+                let diags = check_port_conflicts(&td);
+                prop_assert!(!diags.is_empty(), "expected at least one conflict");
+                prop_assert!(
+                    diags.iter().all(|d| d.severity == Severity::Error),
+                    "all port conflicts must be Error severity"
+                );
+            }
+
+            /// Property: When hostPort is omitted, it defaults to containerPort for conflict detection.
+            #[test]
+            fn host_port_defaults_to_container_port(
+                container_port in 1024u16..65_000,
+            ) {
+                // Two containers both omitting hostPort with the same containerPort ⇒ conflict.
+                let td = make_task_def_with_containers(vec![
+                    ("a".into(), "alpine:latest".into(), vec![(container_port, None, "tcp".into())]),
+                    ("b".into(), "alpine:latest".into(), vec![(container_port, None, "tcp".into())]),
+                ]);
+                prop_assert!(!check_port_conflicts(&td).is_empty());
+            }
+
+            /// Property: Adding a port mapping never reduces the conflict count.
+            #[test]
+            fn conflict_count_monotonic_in_mappings(
+                extra_hp in 1024u16..65_000,
+                base_hp in 1024u16..65_000,
+            ) {
+                let base = make_task_def_with_containers(vec![
+                    ("a".into(), "alpine:latest".into(), vec![(80, Some(base_hp), "tcp".into())]),
+                    ("b".into(), "alpine:latest".into(), vec![(80, Some(base_hp), "tcp".into())]),
+                ]);
+                let base_count = check_port_conflicts(&base).len();
+                let extended = make_task_def_with_containers(vec![
+                    ("a".into(), "alpine:latest".into(), vec![
+                        (80, Some(base_hp), "tcp".into()),
+                        (81, Some(extra_hp), "tcp".into()),
+                    ]),
+                    ("b".into(), "alpine:latest".into(), vec![(80, Some(base_hp), "tcp".into())]),
+                ]);
+                let ext_count = check_port_conflicts(&extended).len();
+                prop_assert!(
+                    ext_count >= base_count,
+                    "adding mapping reduced conflicts: {base_count} -> {ext_count}"
+                );
+            }
+
             /// Property: validate_extended never panics on arbitrary valid task definitions.
             #[test]
             fn validate_extended_never_panics(

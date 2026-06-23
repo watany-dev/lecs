@@ -618,4 +618,190 @@ mod tests {
         assert!(resolved.override_path.is_none());
         assert!(resolved.secrets_path.is_none());
     }
+
+    // --- Property-based tests ---
+
+    mod pbt {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Generate a profile name that matches the accepted character class.
+        fn arb_valid_profile_name() -> impl Strategy<Value = String> {
+            "[A-Za-z0-9_-]{1,20}"
+        }
+
+        /// Generate any unicode char that is *not* allowed in a profile name.
+        fn arb_invalid_profile_char() -> impl Strategy<Value = char> {
+            proptest::char::any().prop_filter("must be disallowed", |c| {
+                !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            })
+        }
+
+        /// Generate a non-empty profile name that contains at least one invalid char.
+        fn arb_invalid_profile_name() -> impl Strategy<Value = String> {
+            (
+                arb_valid_profile_name(),
+                arb_invalid_profile_char(),
+                0usize..6,
+            )
+                .prop_map(|(valid, bad, raw_pos)| {
+                    let bytes = valid.len();
+                    let insert_at = raw_pos.min(bytes);
+                    let mut out = String::with_capacity(bytes + bad.len_utf8());
+                    out.push_str(&valid[..insert_at]);
+                    out.push(bad);
+                    out.push_str(&valid[insert_at..]);
+                    out
+                })
+        }
+
+        /// Generate a POSIX-ish absolute base directory with simple segments.
+        fn arb_base_path() -> impl Strategy<Value = PathBuf> {
+            "(/[a-z][a-z0-9_]{0,8}){1,4}".prop_map(PathBuf::from)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(500))]
+
+            /// Property: Valid profile names (regex `[A-Za-z0-9_-]{1,20}`) are always accepted.
+            #[test]
+            fn valid_profile_name_always_ok(name in arb_valid_profile_name()) {
+                prop_assert!(
+                    validate_profile_name(&name).is_ok(),
+                    "expected '{}' to be accepted",
+                    name
+                );
+            }
+
+            /// Property: Names containing at least one disallowed char are always rejected.
+            #[test]
+            fn invalid_profile_name_always_errors(name in arb_invalid_profile_name()) {
+                let result = validate_profile_name(&name);
+                let is_invalid = matches!(
+                    result,
+                    Err(ProfileError::InvalidProfileName { .. })
+                );
+                prop_assert!(is_invalid, "expected '{}' to be rejected, got {:?}", name, result);
+            }
+
+            /// Property: Empty profile name is always rejected.
+            #[test]
+            fn empty_profile_name_rejected(_seed in 0u32..10u32) {
+                let result = validate_profile_name("");
+                let is_invalid = matches!(
+                    result,
+                    Err(ProfileError::InvalidProfileName { .. })
+                );
+                prop_assert!(is_invalid);
+            }
+
+            /// Property: override path has the expected `lecs-override.<profile>.json` shape.
+            #[test]
+            fn override_path_shape(
+                base in arb_base_path(),
+                profile in arb_valid_profile_name(),
+            ) {
+                let path = profile_override_path(&base, &profile);
+                let expected_file = format!("lecs-override.{profile}.json");
+                prop_assert_eq!(
+                    path.file_name().and_then(|s| s.to_str()),
+                    Some(expected_file.as_str())
+                );
+                prop_assert_eq!(path.parent(), Some(base.as_path()));
+            }
+
+            /// Property: secrets path has the expected `secrets.<profile>.json` shape.
+            #[test]
+            fn secrets_path_shape(
+                base in arb_base_path(),
+                profile in arb_valid_profile_name(),
+            ) {
+                let path = profile_secrets_path(&base, &profile);
+                let expected_file = format!("secrets.{profile}.json");
+                prop_assert_eq!(
+                    path.file_name().and_then(|s| s.to_str()),
+                    Some(expected_file.as_str())
+                );
+                prop_assert_eq!(path.parent(), Some(base.as_path()));
+            }
+
+            /// Property: override and secrets paths for the same profile never collide.
+            #[test]
+            fn profile_paths_differ(
+                base in arb_base_path(),
+                profile in arb_valid_profile_name(),
+            ) {
+                let o = profile_override_path(&base, &profile);
+                let s = profile_secrets_path(&base, &profile);
+                prop_assert_ne!(o, s);
+            }
+
+            /// Property: the profile name always appears in both rendered paths.
+            #[test]
+            fn path_contains_profile_name(
+                base in arb_base_path(),
+                profile in arb_valid_profile_name(),
+            ) {
+                let o = profile_override_path(&base, &profile);
+                let s = profile_secrets_path(&base, &profile);
+                prop_assert!(o.to_string_lossy().contains(&profile));
+                prop_assert!(s.to_string_lossy().contains(&profile));
+            }
+
+            /// Property: CLI profile always wins over config default.
+            #[test]
+            fn effective_profile_cli_wins(
+                cli in arb_valid_profile_name(),
+                default in arb_valid_profile_name(),
+            ) {
+                let config = LecsConfig { default_profile: Some(default) };
+                let result = effective_profile(Some(&cli), Some(&config));
+                prop_assert_eq!(result, Some(cli.as_str()));
+            }
+
+            /// Property: Without CLI profile, config's default_profile is returned.
+            #[test]
+            fn effective_profile_falls_back(default in arb_valid_profile_name()) {
+                let expected = default.clone();
+                let config = LecsConfig { default_profile: Some(default) };
+                let result = effective_profile(None, Some(&config));
+                prop_assert_eq!(result, Some(expected.as_str()));
+            }
+
+            /// Property: When both explicit override and secrets paths are given,
+            /// the profile is ignored entirely on both axes.
+            #[test]
+            fn resolve_explicit_dominates(
+                base in arb_base_path(),
+                profile in arb_valid_profile_name(),
+                o_name in "[a-z]{1,10}\\.json",
+                s_name in "[a-z]{1,10}\\.json",
+            ) {
+                let ov = PathBuf::from(&o_name);
+                let sc = PathBuf::from(&s_name);
+                let resolved = resolve(
+                    &base,
+                    Some(&profile),
+                    Some(ov.as_path()),
+                    Some(sc.as_path()),
+                ).expect("valid profile should not error");
+                prop_assert_eq!(resolved.override_path, Some(ov));
+                prop_assert_eq!(resolved.secrets_path, Some(sc));
+            }
+
+            /// Property: resolve rejects invalid profile names.
+            #[test]
+            fn resolve_rejects_invalid_profile(
+                base in arb_base_path(),
+                bad in arb_invalid_profile_name(),
+            ) {
+                let result = resolve(&base, Some(&bad), None, None);
+                let is_invalid = matches!(
+                    result,
+                    Err(ProfileError::InvalidProfileName { .. })
+                );
+                prop_assert!(is_invalid);
+            }
+        }
+    }
 }

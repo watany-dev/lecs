@@ -2283,5 +2283,315 @@ mod tests {
                 prop_assert!(result.is_err(), "relative path '{}' should be rejected", path);
             }
         }
+
+        // ── Synthesized task definition JSON ───────────────────────────
+
+        /// Spec for a single port mapping in the synthesizer.
+        #[derive(Debug, Clone)]
+        struct PmSpec {
+            container_port: u16,
+            /// `Some(Some(p))` emits `"hostPort": p`; `Some(None)` emits nothing;
+            /// reserved for future `null` emission.
+            host_port: Option<u16>,
+            /// `None` omits the "protocol" key (default: "tcp").
+            protocol: Option<&'static str>,
+        }
+
+        /// Spec for a single container in the synthesizer.
+        #[derive(Debug, Clone)]
+        struct ContainerSpec {
+            name: String,
+            essential: Option<bool>,
+            port_mappings: Vec<PmSpec>,
+        }
+
+        fn arb_dep_condition_str() -> impl Strategy<Value = &'static str> {
+            prop_oneof![
+                Just("START"),
+                Just("COMPLETE"),
+                Just("SUCCESS"),
+                Just("HEALTHY"),
+            ]
+        }
+
+        fn arb_pm_spec() -> impl Strategy<Value = PmSpec> {
+            (
+                1024u16..65_000,
+                proptest::option::of(1024u16..65_000),
+                proptest::option::of(prop_oneof![Just("tcp"), Just("udp")]),
+            )
+                .prop_map(|(cp, hp, protocol)| PmSpec {
+                    container_port: cp,
+                    host_port: hp,
+                    protocol,
+                })
+        }
+
+        /// Generate a task-def spec with unique container names and index-safe deps.
+        #[allow(clippy::type_complexity)]
+        fn arb_task_spec() -> impl Strategy<Value = (String, Vec<ContainerSpec>)> {
+            let names_strat = proptest::collection::vec("[a-z][a-z0-9-]{0,9}", 1..=4);
+            let family_strat = "[a-z][a-z0-9-]{0,12}";
+            (family_strat, names_strat).prop_flat_map(|(family, names)| {
+                // Deduplicate names.
+                let unique: Vec<String> = {
+                    let mut seen = std::collections::HashSet::new();
+                    names
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, n)| {
+                            if seen.insert(n.clone()) {
+                                n
+                            } else {
+                                format!("{n}{i}")
+                            }
+                        })
+                        .collect()
+                };
+                let n = unique.len();
+                let per_container: Vec<_> = (0..n)
+                    .map(|i| {
+                        let name = unique[i].clone();
+                        (
+                            proptest::option::of(any::<bool>()),
+                            proptest::collection::vec(arb_pm_spec(), 0..=2),
+                        )
+                            .prop_map(move |(essential, port_mappings)| {
+                                ContainerSpec {
+                                    name: name.clone(),
+                                    essential,
+                                    port_mappings,
+                                }
+                            })
+                    })
+                    .collect();
+                (Just(family), per_container)
+            })
+        }
+
+        /// Build a `TaskDefinition` JSON string from a synthesized spec.
+        fn build_json(family: &str, containers: &[ContainerSpec]) -> String {
+            use serde_json::{Map, Value, json};
+
+            let container_values: Vec<Value> = containers
+                .iter()
+                .map(|c| {
+                    let mut obj = Map::new();
+                    obj.insert("name".into(), json!(c.name));
+                    obj.insert("image".into(), json!("alpine:latest"));
+                    if let Some(e) = c.essential {
+                        obj.insert("essential".into(), json!(e));
+                    }
+                    if !c.port_mappings.is_empty() {
+                        let pms: Vec<Value> = c
+                            .port_mappings
+                            .iter()
+                            .map(|p| {
+                                let mut m = Map::new();
+                                m.insert("containerPort".into(), json!(p.container_port));
+                                if let Some(hp) = p.host_port {
+                                    m.insert("hostPort".into(), json!(hp));
+                                }
+                                if let Some(proto) = p.protocol {
+                                    m.insert("protocol".into(), json!(proto));
+                                }
+                                Value::Object(m)
+                            })
+                            .collect();
+                        obj.insert("portMappings".into(), Value::Array(pms));
+                    }
+                    Value::Object(obj)
+                })
+                .collect();
+            json!({
+                "family": family,
+                "containerDefinitions": container_values,
+            })
+            .to_string()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(100))]
+
+            /// Property: Synthesized valid JSON always parses successfully.
+            #[test]
+            fn valid_json_parses_ok((family, cs) in arb_task_spec()) {
+                let json = build_json(&family, &cs);
+                let result = TaskDefinition::from_json(&json);
+                prop_assert!(result.is_ok(), "should parse: {:?}", result.err());
+            }
+
+            /// Property: Family name round-trips through parse.
+            #[test]
+            fn parse_preserves_family((family, cs) in arb_task_spec()) {
+                let json = build_json(&family, &cs);
+                let td = TaskDefinition::from_json(&json).expect("parses");
+                prop_assert_eq!(td.family, family);
+            }
+
+            /// Property: Container count round-trips through parse.
+            #[test]
+            fn parse_preserves_container_count((family, cs) in arb_task_spec()) {
+                let json = build_json(&family, &cs);
+                let td = TaskDefinition::from_json(&json).expect("parses");
+                prop_assert_eq!(td.container_definitions.len(), cs.len());
+            }
+
+            /// Property: Container names round-trip in order.
+            #[test]
+            fn parse_preserves_container_names((family, cs) in arb_task_spec()) {
+                let json = build_json(&family, &cs);
+                let td = TaskDefinition::from_json(&json).expect("parses");
+                let parsed_names: Vec<&str> = td
+                    .container_definitions
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
+                let expected: Vec<&str> = cs.iter().map(|c| c.name.as_str()).collect();
+                prop_assert_eq!(parsed_names, expected);
+            }
+
+            /// Property: Port-mapping protocol round-trips when present.
+            #[test]
+            fn parse_preserves_port_mapping_protocol((family, cs) in arb_task_spec()) {
+                let json = build_json(&family, &cs);
+                let td = TaskDefinition::from_json(&json).expect("parses");
+                for (c_spec, c_parsed) in cs.iter().zip(td.container_definitions.iter()) {
+                    for (pm_spec, pm_parsed) in
+                        c_spec.port_mappings.iter().zip(c_parsed.port_mappings.iter())
+                    {
+                        let expected = pm_spec.protocol.unwrap_or("tcp");
+                        prop_assert_eq!(&pm_parsed.protocol, expected);
+                    }
+                }
+            }
+
+            /// Property: Omitting "essential" in JSON yields true after parse.
+            #[test]
+            fn parse_defaults_essential_true(name in "[a-z][a-z0-9]{0,8}") {
+                let spec = vec![ContainerSpec {
+                    name,
+                    essential: None,
+                    port_mappings: vec![],
+                }];
+                let json = build_json("fam", &spec);
+                let td = TaskDefinition::from_json(&json).expect("parses");
+                prop_assert!(td.container_definitions[0].essential);
+            }
+
+            /// Property: Omitting "protocol" yields "tcp" after parse.
+            #[test]
+            fn parse_defaults_protocol_tcp(container_port in 1024u16..65_000) {
+                let spec = vec![ContainerSpec {
+                    name: "c".to_string(),
+                    essential: None,
+                    port_mappings: vec![PmSpec {
+                        container_port,
+                        host_port: None,
+                        protocol: None,
+                    }],
+                }];
+                let json = build_json("fam", &spec);
+                let td = TaskDefinition::from_json(&json).expect("parses");
+                prop_assert_eq!(&td.container_definitions[0].port_mappings[0].protocol, "tcp");
+            }
+
+            /// Property: Omitting "hostPort" yields None after parse.
+            #[test]
+            fn parse_defaults_host_port_none(container_port in 1024u16..65_000) {
+                let spec = vec![ContainerSpec {
+                    name: "c".to_string(),
+                    essential: None,
+                    port_mappings: vec![PmSpec {
+                        container_port,
+                        host_port: None,
+                        protocol: None,
+                    }],
+                }];
+                let json = build_json("fam", &spec);
+                let td = TaskDefinition::from_json(&json).expect("parses");
+                prop_assert!(td.container_definitions[0].port_mappings[0].host_port.is_none());
+            }
+
+            /// Property: Parsing then reconstructing JSON from parsed values is idempotent.
+            #[test]
+            fn parse_then_reparse_idempotent((family, cs) in arb_task_spec()) {
+                let json = build_json(&family, &cs);
+                let td1 = TaskDefinition::from_json(&json).expect("parses");
+
+                // Rebuild spec from parsed td1 and compare second-round parse.
+                let rebuilt: Vec<ContainerSpec> = td1
+                    .container_definitions
+                    .iter()
+                    .map(|c| ContainerSpec {
+                        name: c.name.clone(),
+                        essential: Some(c.essential),
+                        port_mappings: c.port_mappings.iter().map(|pm| PmSpec {
+                            container_port: pm.container_port,
+                            host_port: pm.host_port,
+                            protocol: if pm.protocol == "tcp" { Some("tcp") } else { Some("udp") },
+                        }).collect(),
+                    })
+                    .collect();
+                let json2 = build_json(&td1.family, &rebuilt);
+                let td2 = TaskDefinition::from_json(&json2).expect("reparses");
+                prop_assert_eq!(td2.family, td1.family);
+                prop_assert_eq!(td2.container_definitions.len(), td1.container_definitions.len());
+                for (a, b) in td1.container_definitions.iter().zip(td2.container_definitions.iter()) {
+                    prop_assert_eq!(&a.name, &b.name);
+                    prop_assert_eq!(a.essential, b.essential);
+                    prop_assert_eq!(a.port_mappings.len(), b.port_mappings.len());
+                }
+            }
+
+            /// Property: HealthCheck defaults are applied when only "command" is given.
+            #[test]
+            fn health_check_defaults_applied(shell_cmd in "[a-z]{1,10}") {
+                let json = format!(
+                    r#"{{
+                        "family": "fam",
+                        "containerDefinitions": [{{
+                            "name": "c",
+                            "image": "alpine:latest",
+                            "healthCheck": {{ "command": ["CMD-SHELL", "{shell_cmd}"] }}
+                        }}]
+                    }}"#
+                );
+                let td = TaskDefinition::from_json(&json).expect("parses");
+                let hc = td.container_definitions[0].health_check.as_ref().expect("present");
+                prop_assert_eq!(hc.interval, 30);
+                prop_assert_eq!(hc.timeout, 5);
+                prop_assert_eq!(hc.retries, 3);
+                prop_assert_eq!(hc.start_period, 0);
+            }
+
+            /// Property: All four DependencyCondition variants round-trip via SCREAMING_SNAKE_CASE.
+            #[test]
+            fn dependency_condition_roundtrip(cond in arb_dep_condition_str()) {
+                // HEALTHY requires a healthCheck on the target; add one for all variants
+                // so the same JSON template applies.
+                let json = format!(
+                    r#"{{
+                        "family": "fam",
+                        "containerDefinitions": [
+                            {{"name": "a", "image": "alpine:latest",
+                              "healthCheck": {{ "command": ["CMD-SHELL", "true"] }}}},
+                            {{"name": "b", "image": "alpine:latest",
+                              "dependsOn": [{{"containerName": "a", "condition": "{cond}"}}]}}
+                        ]
+                    }}"#
+                );
+                let td = TaskDefinition::from_json(&json).expect("parses");
+                let got = td.container_definitions[1].depends_on[0].condition;
+                let expected = match cond {
+                    "START" => DependencyCondition::Start,
+                    "COMPLETE" => DependencyCondition::Complete,
+                    "SUCCESS" => DependencyCondition::Success,
+                    "HEALTHY" => DependencyCondition::Healthy,
+                    _ => unreachable!(),
+                };
+                prop_assert_eq!(got, expected);
+            }
+        }
     }
 }

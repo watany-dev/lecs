@@ -832,4 +832,190 @@ mod tests {
             "expected CfnNoEcsResource, got: {err}"
         );
     }
+
+    // --- Property-based tests ---
+
+    mod pbt {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_logical_id() -> impl Strategy<Value = String> {
+            "[A-Z][A-Za-z0-9]{0,20}"
+        }
+
+        fn arb_family() -> impl Strategy<Value = String> {
+            "[a-zA-Z0-9_-]{1,20}"
+        }
+
+        fn arb_container_name() -> impl Strategy<Value = String> {
+            "[a-zA-Z0-9_-]{1,20}"
+        }
+
+        fn arb_image() -> impl Strategy<Value = String> {
+            "[a-z][a-z0-9]{0,10}:[a-z0-9][a-z0-9.]{0,8}"
+        }
+
+        /// Build a `CloudFormation` template with one ECS task-definition resource.
+        fn build_single(logical_id: &str, family: &str, containers: &[(String, String)]) -> String {
+            let cds: Vec<Value> = containers
+                .iter()
+                .map(|(n, i)| {
+                    serde_json::json!({
+                        "Name": n,
+                        "Image": i,
+                        "Essential": true,
+                    })
+                })
+                .collect();
+            let template = serde_json::json!({
+                "AWSTemplateFormatVersion": "2010-09-09",
+                "Resources": {
+                    logical_id: {
+                        "Type": "AWS::ECS::TaskDefinition",
+                        "Properties": {
+                            "Family": family,
+                            "ContainerDefinitions": cds,
+                        }
+                    }
+                }
+            });
+            template.to_string()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(50))]
+
+            /// Property: A template with PascalCase keys parses OK and preserves
+            /// family and container names/count.
+            #[test]
+            fn cfn_pascal_keys_parse_ok(
+                logical_id in arb_logical_id(),
+                family in arb_family(),
+                containers in proptest::collection::vec(
+                    (arb_container_name(), arb_image()),
+                    1..=4,
+                ),
+            ) {
+                // Deduplicate container names to satisfy ECS uniqueness validation.
+                let mut seen = std::collections::HashSet::new();
+                let unique: Vec<_> = containers
+                    .into_iter()
+                    .filter(|(n, _)| seen.insert(n.clone()))
+                    .collect();
+                prop_assume!(!unique.is_empty());
+
+                let json = build_single(&logical_id, &family, &unique);
+                let td = from_cfn_json(&json, None).expect("parses");
+                prop_assert_eq!(td.family, family);
+                prop_assert_eq!(td.container_definitions.len(), unique.len());
+                let td_names: std::collections::HashSet<_> =
+                    td.container_definitions.iter().map(|c| c.name.clone()).collect();
+                let expected_names: std::collections::HashSet<_> =
+                    unique.iter().map(|(n, _)| n.clone()).collect();
+                prop_assert_eq!(td_names, expected_names);
+            }
+
+            /// Property: Injecting any known intrinsic function as a single-key
+            /// object into the TaskRoleArn property always yields CfnIntrinsicFunction.
+            #[test]
+            fn cfn_intrinsic_function_always_rejected(
+                logical_id in arb_logical_id(),
+                family in arb_family(),
+                container_name in arb_container_name(),
+                image in arb_image(),
+                intrinsic_key in prop::sample::select(vec![
+                    "Ref", "Fn::Sub", "Fn::Join", "Fn::GetAtt", "Fn::ImportValue",
+                    "Fn::Select", "Fn::Split", "Fn::If", "Fn::Base64",
+                ]),
+                arg_value in "[a-zA-Z0-9_-]{1,20}",
+            ) {
+                let template = serde_json::json!({
+                    "Resources": {
+                        logical_id: {
+                            "Type": "AWS::ECS::TaskDefinition",
+                            "Properties": {
+                                "Family": family,
+                                "TaskRoleArn": { intrinsic_key: arg_value },
+                                "ContainerDefinitions": [{
+                                    "Name": container_name,
+                                    "Image": image,
+                                    "Essential": true,
+                                }]
+                            }
+                        }
+                    }
+                });
+                let err = from_cfn_json(&template.to_string(), None).expect_err("intrinsic err");
+                let is_intrinsic = matches!(err, TaskDefError::CfnIntrinsicFunction { .. });
+                prop_assert!(is_intrinsic, "unexpected error: {err}");
+                prop_assert!(err.to_string().contains(intrinsic_key));
+            }
+
+            /// Property: When multiple ECS resources exist and no id is given,
+            /// CfnMultipleResources is returned; with a valid id, the right
+            /// resource is selected. Unknown id yields CfnResourceNotFound.
+            #[test]
+            fn cfn_multiple_resources_requires_id(
+                id_a in arb_logical_id(),
+                id_b in arb_logical_id(),
+                fam_a in arb_family(),
+                fam_b in arb_family(),
+                cname in arb_container_name(),
+                image in arb_image(),
+            ) {
+                prop_assume!(id_a != id_b);
+                let template = serde_json::json!({
+                    "Resources": {
+                        id_a.clone(): {
+                            "Type": "AWS::ECS::TaskDefinition",
+                            "Properties": {
+                                "Family": fam_a,
+                                "ContainerDefinitions": [{
+                                    "Name": cname,
+                                    "Image": image,
+                                    "Essential": true,
+                                }]
+                            }
+                        },
+                        id_b.clone(): {
+                            "Type": "AWS::ECS::TaskDefinition",
+                            "Properties": {
+                                "Family": fam_b,
+                                "ContainerDefinitions": [{
+                                    "Name": "second",
+                                    "Image": "img:v2",
+                                    "Essential": true,
+                                }]
+                            }
+                        }
+                    }
+                });
+                let json = template.to_string();
+
+                // No id: multiple-resources error.
+                let err = from_cfn_json(&json, None).expect_err("expected multiple err");
+                let is_multiple = matches!(err, TaskDefError::CfnMultipleResources { .. });
+                prop_assert!(is_multiple, "unexpected error: {err}");
+
+                // Correct id: selects the expected resource.
+                let td_b = from_cfn_json(&json, Some(&id_b)).expect("selects b");
+                prop_assert_eq!(td_b.family, fam_b);
+
+                // Unknown id: not-found error.
+                let bogus = format!("Zz_{id_a}_{id_b}_XX");
+                let err = from_cfn_json(&json, Some(&bogus)).expect_err("not found");
+                let is_not_found = matches!(err, TaskDefError::CfnResourceNotFound(_));
+                prop_assert!(is_not_found, "unexpected error: {err}");
+            }
+
+            /// Property: pascal_to_camel is idempotent on its own output
+            /// (since the first character is already lowercase after one call).
+            #[test]
+            fn pascal_to_camel_idempotent(s in "[A-Za-z][A-Za-z0-9]{0,20}") {
+                let once = pascal_to_camel(&s);
+                let twice = pascal_to_camel(&once);
+                prop_assert_eq!(once, twice);
+            }
+        }
+    }
 }

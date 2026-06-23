@@ -735,4 +735,150 @@ mod tests {
             "expected 'container_definitions' in error: {err}"
         );
     }
+
+    // --- Property-based tests ---
+
+    mod pbt {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_family() -> impl Strategy<Value = String> {
+            "[a-zA-Z0-9_-]{1,20}"
+        }
+
+        fn arb_container_name() -> impl Strategy<Value = String> {
+            "[a-zA-Z0-9_-]{1,20}"
+        }
+
+        fn arb_image() -> impl Strategy<Value = String> {
+            "[a-z][a-z0-9]{0,10}:[a-z0-9][a-z0-9.]{0,8}"
+        }
+
+        fn arb_address() -> impl Strategy<Value = String> {
+            "aws_ecs_task_definition\\.[a-z][a-z0-9_]{0,10}"
+        }
+
+        type TfResource = (String, String, Vec<(String, String)>);
+
+        /// Build a Terraform plan JSON with the given resources (address, family, container names).
+        fn build_tf_json(resources: &[TfResource]) -> String {
+            let res_json: Vec<serde_json::Value> = resources
+                .iter()
+                .map(|(address, family, containers)| {
+                    let cds: Vec<serde_json::Value> = containers
+                        .iter()
+                        .map(|(name, image)| {
+                            serde_json::json!({
+                                "name": name,
+                                "image": image,
+                                "essential": true,
+                            })
+                        })
+                        .collect();
+                    let cd_string = serde_json::Value::Array(cds).to_string();
+                    serde_json::json!({
+                        "address": address,
+                        "type": "aws_ecs_task_definition",
+                        "values": {
+                            "family": family,
+                            "container_definitions": cd_string,
+                        }
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "format_version": "1.0",
+                "planned_values": {
+                    "root_module": { "resources": res_json }
+                }
+            })
+            .to_string()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(50))]
+
+            /// Property: A well-formed Terraform plan with one ECS resource parses OK
+            /// and preserves family and container count/names.
+            #[test]
+            fn terraform_planned_values_parse_ok(
+                family in arb_family(),
+                address in arb_address(),
+                containers in proptest::collection::vec(
+                    (arb_container_name(), arb_image()),
+                    1..=4,
+                ),
+            ) {
+                // Deduplicate container names.
+                let mut seen = std::collections::HashSet::new();
+                let unique: Vec<_> = containers
+                    .into_iter()
+                    .filter(|(n, _)| seen.insert(n.clone()))
+                    .collect();
+                prop_assume!(!unique.is_empty());
+
+                let json = build_tf_json(&[(address, family.clone(), unique.clone())]);
+                let td = from_terraform_json(&json, None).expect("parses");
+                prop_assert_eq!(td.family, family);
+                prop_assert_eq!(td.container_definitions.len(), unique.len());
+                for (i, (name, _)) in unique.iter().enumerate() {
+                    prop_assert_eq!(&td.container_definitions[i].name, name);
+                }
+            }
+
+            /// Property: When multiple resources exist, address selection returns
+            /// the correct one identified by family.
+            #[test]
+            fn terraform_resource_address_selects_correct_one(
+                fam_a in arb_family(),
+                fam_b in arb_family(),
+                container_name in arb_container_name(),
+                image in arb_image(),
+                addr_suffix_a in "[a-z][a-z0-9_]{0,8}",
+                addr_suffix_b in "[a-z][a-z0-9_]{0,8}",
+            ) {
+                prop_assume!(addr_suffix_a != addr_suffix_b);
+                let addr_a = format!("aws_ecs_task_definition.{addr_suffix_a}");
+                let addr_b = format!("aws_ecs_task_definition.{addr_suffix_b}");
+                let cds = vec![(container_name, image)];
+                let json = build_tf_json(&[
+                    (addr_a.clone(), fam_a.clone(), cds.clone()),
+                    (addr_b.clone(), fam_b.clone(), cds),
+                ]);
+
+                let td_a = from_terraform_json(&json, Some(&addr_a)).expect("selects a");
+                prop_assert_eq!(td_a.family, fam_a);
+
+                let td_b = from_terraform_json(&json, Some(&addr_b)).expect("selects b");
+                prop_assert_eq!(td_b.family, fam_b);
+
+                // Missing selector should error with 'multiple'.
+                let err = from_terraform_json(&json, None).expect_err("expected multiple err");
+                let is_multiple = matches!(err, TaskDefError::TerraformMultipleResources { .. });
+                prop_assert!(is_multiple);
+            }
+
+            /// Property: An unknown address selector always yields
+            /// TerraformResourceNotFound, regardless of resource content.
+            #[test]
+            fn terraform_unknown_address_always_not_found(
+                family in arb_family(),
+                address in arb_address(),
+                container_name in arb_container_name(),
+                image in arb_image(),
+                bogus_suffix in "[a-z][a-z0-9_]{0,8}",
+            ) {
+                let bogus = format!("aws_ecs_task_definition.xx_bogus_{bogus_suffix}");
+                prop_assume!(bogus != address);
+
+                let json = build_tf_json(&[(
+                    address,
+                    family,
+                    vec![(container_name, image)],
+                )]);
+                let err = from_terraform_json(&json, Some(&bogus)).expect_err("not found");
+                prop_assert!(matches!(err, TaskDefError::TerraformResourceNotFound(_)));
+            }
+        }
+    }
 }

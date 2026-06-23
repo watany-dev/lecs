@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d99e2dd9220bead29575d0a7096c0275724976a46ef5821001014b7832c2cfe9 # shrinks to cond = "HEALTHY"
+cc 7140d61e3d7459166ffbcde4664a942823fc75be3de892d1d65122fcced7ea47 # shrinks to cmd = "a"
+cc 11b734c8eba45828a39370b55775d2fec551862d8c32ee31172f914e6a1940ba # shrinks to (family, cs) = ("a", [ContainerSpec { name: "bxiq-", essential: None, port_mappings: [], depends_on: [] }, ContainerSpec { name: "xscy6", essential: None, port_mappings: [], depends_on: [(0, "HEALTHY")] }])
+cc 13718c7cd16559fccfdaef9217b40359e744a86957b41d707d882a62e991b312 # shrinks to (family, cs) = ("a", [ContainerSpec { name: "z8c13-", essential: None, port_mappings: [], depends_on: [] }, ContainerSpec { name: "ls--n", essential: None, port_mappings: [], depends_on: [(0, "HEALTHY")] }])
+cc 99eccea7704ce696776b3c06d3569017323d5ac8f034369cbc74a09e258a6d22 # shrinks to (family, cs) = ("a", [ContainerSpec { name: "nm---6-", essential: None, port_mappings: [], depends_on: [] }, ContainerSpec { name: "h", essential: None, port_mappings: [], depends_on: [(0, "HEALTHY")] }])
+cc e81e18fd2462da507636ec08d5aa9d53f2963b2f19ff7531b6749fe5496a37f7 # shrinks to (family, cs) = ("a", [ContainerSpec { name: "f-6rp47-g", essential: None, port_mappings: [], depends_on: [] }, ContainerSpec { name: "s87008q-", essential: None, port_mappings: [], depends_on: [(0, "HEALTHY")] }])

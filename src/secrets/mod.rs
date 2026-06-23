@@ -164,4 +164,136 @@ mod tests {
         };
         assert!(err.to_string().contains("arn:test"));
     }
+
+    // --- Property-based tests ---
+
+    mod pbt {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_arn() -> impl Strategy<Value = String> {
+            ("[a-z0-9-]{1,20}", "[0-9]{12}", "[a-zA-Z0-9/_+=.@-]{1,20}").prop_map(
+                |(region, account, name)| {
+                    format!("arn:aws:secretsmanager:{region}:{account}:secret:{name}")
+                },
+            )
+        }
+
+        fn arb_secret_name() -> impl Strategy<Value = String> {
+            "[A-Z][A-Z0-9_]{0,15}"
+        }
+
+        fn arb_secret_value() -> impl Strategy<Value = String> {
+            "[a-zA-Z0-9_.-]{1,30}"
+        }
+
+        /// Generate (mapping, secrets) where every secret references an ARN in the mapping.
+        fn arb_mapping_and_secrets(
+            n: usize,
+        ) -> impl Strategy<Value = (HashMap<String, String>, Vec<Secret>)> {
+            let pairs_strat = proptest::collection::vec(
+                (arb_arn(), arb_secret_value(), arb_secret_name()),
+                n..=n,
+            );
+            pairs_strat.prop_map(|triples| {
+                // Deduplicate ARNs, keeping the first occurrence.
+                let mut mapping = HashMap::new();
+                let mut secrets = Vec::new();
+                for (arn, value, name) in triples {
+                    mapping.entry(arn.clone()).or_insert_with(|| value.clone());
+                    secrets.push(Secret {
+                        name,
+                        value_from: arn,
+                    });
+                }
+                (mapping, secrets)
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(300))]
+
+            /// Property: When every secret ARN is in the mapping, resolve succeeds.
+            #[test]
+            fn all_present_resolves_ok((mapping, secrets) in arb_mapping_and_secrets(3)) {
+                let resolver = SecretsResolver { mapping };
+                let result = resolver.resolve(&secrets);
+                prop_assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+            }
+
+            /// Property: resolved list preserves order and count of input secrets.
+            #[test]
+            fn resolve_preserves_order_and_count(
+                (mapping, secrets) in arb_mapping_and_secrets(4),
+            ) {
+                let resolver = SecretsResolver { mapping };
+                let resolved = resolver.resolve(&secrets).expect("resolves");
+                prop_assert_eq!(resolved.len(), secrets.len());
+                for (i, (name, _)) in resolved.iter().enumerate() {
+                    prop_assert_eq!(name, &secrets[i].name);
+                }
+            }
+
+            /// Property: resolved values equal the mapping values for the same ARN.
+            #[test]
+            fn resolve_values_match_mapping(
+                (mapping, secrets) in arb_mapping_and_secrets(4),
+            ) {
+                let resolver = SecretsResolver { mapping: mapping.clone() };
+                let resolved = resolver.resolve(&secrets).expect("resolves");
+                for (i, (_name, value)) in resolved.iter().enumerate() {
+                    let expected = mapping
+                        .get(&secrets[i].value_from)
+                        .expect("value exists");
+                    prop_assert_eq!(value, expected);
+                }
+            }
+
+            /// Property: A missing ARN always produces ArnNotFound with that ARN.
+            #[test]
+            fn missing_arn_produces_arn_not_found(
+                (mapping, _) in arb_mapping_and_secrets(2),
+                missing_arn in arb_arn(),
+                secret_name in arb_secret_name(),
+            ) {
+                // Ensure the generated arn is not in the mapping.
+                let missing = if mapping.contains_key(&missing_arn) {
+                    format!("{missing_arn}xx-not-present")
+                } else {
+                    missing_arn
+                };
+                let resolver = SecretsResolver { mapping };
+                let secrets = vec![Secret {
+                    name: secret_name,
+                    value_from: missing.clone(),
+                }];
+                let err = resolver.resolve(&secrets).expect_err("should be missing");
+                let is_not_found = matches!(
+                    err,
+                    SecretsError::ArnNotFound { ref arn } if arn == &missing
+                );
+                prop_assert!(is_not_found, "unexpected error: {err}");
+            }
+
+            /// Property: resolving an empty slice always yields Ok([]).
+            #[test]
+            fn empty_secrets_always_ok((mapping, _) in arb_mapping_and_secrets(2)) {
+                let resolver = SecretsResolver { mapping };
+                let resolved = resolver.resolve(&[]).expect("resolves");
+                prop_assert!(resolved.is_empty());
+            }
+
+            /// Property: Serializing a mapping as JSON and parsing it back yields the
+            /// same mapping (lookup-equivalent).
+            #[test]
+            fn json_roundtrip_parses((mapping, _) in arb_mapping_and_secrets(3)) {
+                let json = serde_json::to_string(&mapping).expect("serializes");
+                let roundtrip = SecretsResolver::from_json(&json).expect("parses");
+                for (k, v) in &mapping {
+                    prop_assert_eq!(roundtrip.mapping.get(k), Some(v));
+                }
+                prop_assert_eq!(roundtrip.mapping.len(), mapping.len());
+            }
+        }
+    }
 }
