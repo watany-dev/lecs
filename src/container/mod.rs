@@ -8,6 +8,7 @@ use bollard::container::{
     RemoveContainerOptions, StatsOptions, StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
+use bollard::image::CreateImageOptions;
 use bollard::models::{EndpointSettings, HealthConfig, HostConfig, PortBinding, ResourcesUlimits};
 use bollard::network::{CreateNetworkOptions, ListNetworksOptions};
 use futures_util::Stream;
@@ -71,6 +72,13 @@ pub trait ContainerRuntime: Send + Sync {
 
     /// Execute a command inside a running container.
     async fn exec_container(&self, id: &str, cmd: &[String]) -> Result<ExecResult, ContainerError>;
+
+    /// Pull a container image from a registry.
+    ///
+    /// The `image` parameter is the full image reference (e.g., `nginx:latest`,
+    /// `registry.example.com/app:v1.0`). The implementation handles splitting
+    /// the reference into repository and tag components.
+    async fn pull_image(&self, image: &str) -> Result<(), ContainerError>;
 }
 
 /// Result of executing a command inside a container.
@@ -698,6 +706,49 @@ impl ContainerRuntime for ContainerClient {
             exit_code: inspect.exit_code,
         })
     }
+
+    async fn pull_image(&self, image: &str) -> Result<(), ContainerError> {
+        let (from_image, tag) = parse_image_reference(image);
+        let options = if tag.is_empty() {
+            CreateImageOptions {
+                from_image: from_image.to_string(),
+                ..Default::default()
+            }
+        } else {
+            CreateImageOptions {
+                from_image: from_image.to_string(),
+                tag: tag.to_string(),
+                ..Default::default()
+            }
+        };
+        self.docker
+            .create_image(Some(options), None, None)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
+    }
+}
+
+/// Parse an image reference into (repository, tag) for bollard `CreateImageOptions`.
+///
+/// Handles registry ports (e.g. `registry:5000/app:v1`) and digest references
+/// (e.g. `nginx@sha256:abc...`).
+fn parse_image_reference(image: &str) -> (&str, &str) {
+    // Digest reference: return as-is with empty tag
+    if image.contains('@') {
+        return (image, "");
+    }
+
+    // Find the last '/' to isolate the name+tag portion from registry/namespace
+    let after_slash = image.rfind('/').map_or(0, |pos| pos + 1);
+
+    // Look for ':' in the portion after the last '/'
+    image[after_slash..]
+        .rfind(':')
+        .map_or((image, "latest"), |colon_offset| {
+            let colon_pos = after_slash + colon_offset;
+            (&image[..colon_pos], &image[colon_pos + 1..])
+        })
 }
 
 /// Calculate CPU usage percentage from a Docker stats snapshot.
@@ -896,6 +947,7 @@ pub mod test_support {
         pub wait_container_results: Mutex<VecDeque<Result<WaitResult, ContainerError>>>,
         pub stats_container_results: Mutex<VecDeque<Result<ContainerStats, ContainerError>>>,
         pub exec_container_results: Mutex<VecDeque<Result<ExecResult, ContainerError>>>,
+        pub pull_image_results: Mutex<VecDeque<Result<(), ContainerError>>>,
     }
 
     impl MockContainerClient {
@@ -913,6 +965,7 @@ pub mod test_support {
                 wait_container_results: Mutex::new(VecDeque::new()),
                 stats_container_results: Mutex::new(VecDeque::new()),
                 exec_container_results: Mutex::new(VecDeque::new()),
+                pull_image_results: Mutex::new(VecDeque::new()),
             }
         }
     }
@@ -996,6 +1049,10 @@ pub mod test_support {
             _cmd: &[String],
         ) -> Result<ExecResult, ContainerError> {
             pop_result(&self.exec_container_results)
+        }
+
+        async fn pull_image(&self, _image: &str) -> Result<(), ContainerError> {
+            pop_result(&self.pull_image_results)
         }
     }
 }
@@ -1393,5 +1450,47 @@ mod tests {
 
         let host_config = result.host_config.as_ref().expect("host_config");
         assert!(host_config.binds.is_none());
+    }
+
+    #[test]
+    fn parse_image_reference_bare_name() {
+        let (repo, tag) = parse_image_reference("nginx");
+        assert_eq!(repo, "nginx");
+        assert_eq!(tag, "latest");
+    }
+
+    #[test]
+    fn parse_image_reference_with_tag() {
+        let (repo, tag) = parse_image_reference("nginx:1.25");
+        assert_eq!(repo, "nginx");
+        assert_eq!(tag, "1.25");
+    }
+
+    #[test]
+    fn parse_image_reference_namespaced() {
+        let (repo, tag) = parse_image_reference("library/nginx:alpine");
+        assert_eq!(repo, "library/nginx");
+        assert_eq!(tag, "alpine");
+    }
+
+    #[test]
+    fn parse_image_reference_registry_port() {
+        let (repo, tag) = parse_image_reference("registry.example.com:5000/app");
+        assert_eq!(repo, "registry.example.com:5000/app");
+        assert_eq!(tag, "latest");
+    }
+
+    #[test]
+    fn parse_image_reference_registry_port_and_tag() {
+        let (repo, tag) = parse_image_reference("registry.example.com:5000/app:v1");
+        assert_eq!(repo, "registry.example.com:5000/app");
+        assert_eq!(tag, "v1");
+    }
+
+    #[test]
+    fn parse_image_reference_digest() {
+        let (repo, tag) = parse_image_reference("nginx@sha256:abcdef1234567890");
+        assert_eq!(repo, "nginx@sha256:abcdef1234567890");
+        assert_eq!(tag, "");
     }
 }

@@ -9,6 +9,8 @@ use serde::Serialize;
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum EventType {
+    /// Container image was pulled from registry.
+    ImagePulled,
     /// Container was created.
     Created,
     /// Container was started.
@@ -184,6 +186,7 @@ mod tests {
     #[test]
     fn event_type_serialization() {
         let types = vec![
+            (EventType::ImagePulled, "\"image_pulled\""),
             (EventType::Created, "\"created\""),
             (EventType::Started, "\"started\""),
             (EventType::HealthCheckPassed, "\"health_check_passed\""),

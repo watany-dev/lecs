@@ -360,7 +360,7 @@ let networking_config = NetworkingConfig {
 | エラー状況 | ContainerError バリアント | 対応 |
 |---|---|---|
 | コンテナランタイム未起動 | `RuntimeNotRunning` | `connect()` で ping 失敗時に検出 |
-| イメージが存在しない | `Api(...)` | ランタイムがデフォルトで pull を試行 |
+| イメージが存在しない | `Api(...)` | `pull_image()` で事前に pull。未取得時はエラー |
 | ポート競合 | `Api(...)` | ランタイム API エラーをそのまま伝搬 |
 | ネットワーク既存 | — | `create_network` 内で既存を検出し再利用（エラーにしない） |
 | コンテナ停止タイムアウト | `Api(...)` | 10 秒後にランタイムが自動 kill |
@@ -389,6 +389,6 @@ let networking_config = NetworkingConfig {
 
 ## 制限事項
 
-- イメージの明示的な pull 制御は未実装（ランタイムのデフォルト動作に委ねる）
+- レジストリ認証: `pull_image()` は `credentials` パラメータに `None` を渡しており、認証付きレジストリへの pull は Docker/Podman のローカル認証情報（`~/.docker/config.json`）に依存する
 - コンテナのリソース制限（CPU/メモリ）は設定するが、厳密な enforcement はランタイムに委ねる
 - ボリュームマウントは未対応 → Phase 5

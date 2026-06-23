@@ -170,6 +170,11 @@ pub async fn restart_container(
         None,
     ));
 
+    // Best-effort pull: failure is logged but does not block restart.
+    if let Err(e) = client.pull_image(&config.image).await {
+        tracing::warn!(container = %container_name, error = %e, "Image pull failed during restart (continuing)");
+    }
+
     if let Some(id) = old_id {
         // Best-effort stop: already-stopped containers are fine.
         if let Err(e) = client.stop_container(id, None).await {
@@ -488,6 +493,7 @@ mod tests {
     async fn run_task_single_container() {
         let mock = MockContainerClient {
             create_network_results: Mutex::new(VecDeque::from([Ok("lecs-web".to_string())])),
+            pull_image_results: Mutex::new(VecDeque::from([Ok(())])),
             create_container_results: Mutex::new(VecDeque::from([Ok("container-1".to_string())])),
             start_container_results: Mutex::new(VecDeque::from([Ok(())])),
             ..MockContainerClient::new()
@@ -508,6 +514,7 @@ mod tests {
     async fn run_task_multi_container() {
         let mock = MockContainerClient {
             create_network_results: Mutex::new(VecDeque::from([Ok("lecs-multi".to_string())])),
+            pull_image_results: Mutex::new(VecDeque::from([Ok(()), Ok(())])),
             create_container_results: Mutex::new(VecDeque::from([
                 Ok("c1".to_string()),
                 Ok("c2".to_string()),
@@ -544,6 +551,7 @@ mod tests {
     async fn run_task_container_create_failure() {
         let mock = MockContainerClient {
             create_network_results: Mutex::new(VecDeque::from([Ok("lecs-multi".to_string())])),
+            pull_image_results: Mutex::new(VecDeque::from([Ok(()), Ok(())])),
             create_container_results: Mutex::new(VecDeque::from([
                 Ok("c1".to_string()),
                 Err(crate::container::ContainerError::RuntimeNotRunning),
@@ -639,6 +647,7 @@ mod tests {
         use crate::events::CollectingEventSink;
 
         let mock = MockContainerClient {
+            pull_image_results: Mutex::new(VecDeque::from([Ok(())])),
             stop_container_results: Mutex::new(VecDeque::from([Ok(())])),
             remove_container_results: Mutex::new(VecDeque::from([Ok(())])),
             create_container_results: Mutex::new(VecDeque::from([Ok("new-id".to_string())])),
@@ -687,6 +696,7 @@ mod tests {
         use crate::events::CollectingEventSink;
 
         let mock = MockContainerClient {
+            pull_image_results: Mutex::new(VecDeque::from([Ok(())])),
             stop_container_results: Mutex::new(VecDeque::from([Err(
                 crate::container::ContainerError::RuntimeNotRunning,
             )])),
@@ -719,6 +729,7 @@ mod tests {
         use crate::events::CollectingEventSink;
 
         let mock = MockContainerClient {
+            pull_image_results: Mutex::new(VecDeque::from([Ok(())])),
             stop_container_results: Mutex::new(VecDeque::from([Ok(())])),
             remove_container_results: Mutex::new(VecDeque::from([Err(
                 crate::container::ContainerError::RuntimeNotRunning,
@@ -749,6 +760,7 @@ mod tests {
         use crate::events::CollectingEventSink;
 
         let mock = MockContainerClient {
+            pull_image_results: Mutex::new(VecDeque::from([Ok(())])),
             stop_container_results: Mutex::new(VecDeque::from([Ok(())])),
             remove_container_results: Mutex::new(VecDeque::from([Ok(())])),
             create_container_results: Mutex::new(VecDeque::from([Err(
@@ -780,6 +792,7 @@ mod tests {
         use crate::events::CollectingEventSink;
 
         let mock = MockContainerClient {
+            pull_image_results: Mutex::new(VecDeque::from([Ok(())])),
             stop_container_results: Mutex::new(VecDeque::from([Ok(())])),
             remove_container_results: Mutex::new(VecDeque::from([Ok(()), Ok(())])),
             create_container_results: Mutex::new(VecDeque::from([Ok("new-id".to_string())])),
@@ -813,6 +826,7 @@ mod tests {
 
         // old_id=None: stop/remove are skipped; only create/start are called.
         let mock = MockContainerClient {
+            pull_image_results: Mutex::new(VecDeque::from([Ok(())])),
             create_container_results: Mutex::new(VecDeque::from([Ok("fresh-id".to_string())])),
             start_container_results: Mutex::new(VecDeque::from([Ok(())])),
             ..MockContainerClient::new()
@@ -1107,6 +1121,7 @@ mod tests {
     async fn run_task_with_dependencies() {
         let mock = MockContainerClient {
             create_network_results: Mutex::new(VecDeque::from([Ok("lecs-test".to_string())])),
+            pull_image_results: Mutex::new(VecDeque::from([Ok(()), Ok(())])),
             create_container_results: Mutex::new(VecDeque::from([
                 Ok("db-id".to_string()),
                 Ok("app-id".to_string()),
